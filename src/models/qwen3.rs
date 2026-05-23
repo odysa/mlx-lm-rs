@@ -279,7 +279,12 @@ impl Model {
                 .collect();
             if !missing.is_empty() {
                 missing.sort();
-                let head = missing.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                let head = missing
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let tail = if missing.len() > 5 {
                     format!(" (+{} more)", missing.len() - 5)
                 } else {

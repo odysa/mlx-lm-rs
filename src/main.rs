@@ -91,7 +91,10 @@ fn main() -> Result<()> {
                 (prompt, true)
             } else {
                 match ChatTemplate::load(&model_dir).context("loading chat template")? {
-                    Some(t) => (t.render(&prompt, true).context("rendering chat template")?, false),
+                    Some(t) => (
+                        t.render(&prompt, true).context("rendering chat template")?,
+                        false,
+                    ),
                     None => (prompt, true),
                 }
             };

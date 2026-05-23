@@ -67,12 +67,21 @@ fn load_once() -> Loaded {
     let cfg = load_config(&dir).expect("config");
     let tokenizer = load_tokenizer(&dir).expect("tokenizer");
     let chat = ChatTemplate::load(&dir).expect("chat template load");
-    let eos_ids = cfg.eos_token_id.as_ref().map(|x| x.ids()).unwrap_or_default();
+    let eos_ids = cfg
+        .eos_token_id
+        .as_ref()
+        .map(|x| x.ids())
+        .unwrap_or_default();
     let mut model = Model::new(cfg).expect("construct model");
     let shards = list_weight_files(&dir).expect("list weight files");
     model.load_weights(&shards).expect("load weights");
     eprintln!("[bench] loaded.");
-    Loaded { model, tokenizer, chat, eos_ids }
+    Loaded {
+        model,
+        tokenizer,
+        chat,
+        eos_ids,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +113,8 @@ fn run_once(prompt: &str) -> RunStats {
     let step = NonZeroUsize::new(2048).unwrap();
 
     let prefill_start = Instant::now();
-    let mut gen = Generator::new(&mut g.model, &ids, max_tok, 0.0, eos_ids, step)
-        .expect("generator");
+    let mut gen =
+        Generator::new(&mut g.model, &ids, max_tok, 0.0, eos_ids, step).expect("generator");
     let _ = gen.next().transpose().expect("first token");
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
 

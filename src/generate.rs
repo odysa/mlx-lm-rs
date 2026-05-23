@@ -95,7 +95,12 @@ impl<'a> Generator<'a> {
 
 /// One decode pass: model forward + sample. Returns the (unmaterialized)
 /// sampled-token Array.
-fn step_decode(model: &mut Model, cache: &mut [KvCache], input: &Array, temp: f32) -> Result<Array> {
+fn step_decode(
+    model: &mut Model,
+    cache: &mut [KvCache],
+    input: &Array,
+    temp: f32,
+) -> Result<Array> {
     let logits = model.forward(input, cache)?;
     let last = logits.index((.., -1, ..));
     sample(&last, temp)
