@@ -1,8 +1,22 @@
 [package]
 name = "mlx-lm-rs"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Greenfield Rust port of mlx-lm — Qwen3 inference on Apple Silicon via mlx-rs"
+license = "Apache-2.0"
+repository = "https://github.com/odysa/mlx-lm-rs"
+homepage = "https://github.com/odysa/mlx-lm-rs"
+readme = "README.md"
+keywords = ["mlx", "qwen", "llm", "inference", "apple-silicon"]
+categories = ["science", "command-line-utilities"]
+exclude = [
+    "/.github",
+    "/.venv-parity",
+    "/benches",
+    "/tests",
+    "*.rlib",
+    "*.html",
+]
 
 [[bin]]
 name = "mlx-lm-rs"
