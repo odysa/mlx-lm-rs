@@ -36,6 +36,16 @@ jobs:
             sudo xcodebuild -downloadComponent MetalToolchain
           )
 
+      - name: Link clang compiler-rt for __isPlatformVersionAtLeast
+        # mlx-sys's C++ uses @available() checks that emit calls to
+        # __isPlatformVersionAtLeast. That symbol lives in clang's
+        # libclang_rt.osx.a, which rustc's `cc -nodefaultlibs` link line
+        # does not pull in, so we have to add it to RUSTFLAGS explicitly.
+        run: |
+          CLANG_RT_DIR="$(clang -print-resource-dir)/lib/darwin"
+          ls "$CLANG_RT_DIR/libclang_rt.osx.a"
+          echo "RUSTFLAGS=-C link-arg=-L${CLANG_RT_DIR} -C link-arg=-lclang_rt.osx" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry / mlx-sys build
         uses: actions/cache@v4
         with:
@@ -43,8 +53,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/release/build/mlx-sys-*/out
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          # Deployment target is part of the cache key so a stale mlx-sys
+          # build from before MACOSX_DEPLOYMENT_TARGET was set gets evicted.
+          key: ${{ runner.os }}-cargo-mt${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-mt${{ env.MACOSX_DEPLOYMENT_TARGET }}-
 
       - name: Build (release)
         run: cargo build --release --all-targets
