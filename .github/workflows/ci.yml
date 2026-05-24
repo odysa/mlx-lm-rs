@@ -14,6 +14,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      # mlx-sys (and onig_sys / alloca) compile against the macos-14 runner's
+      # SDK and reference __isPlatformVersionAtLeast, which only exists when
+      # the deployment target is >= 14. Without this the linker defaults to
+      # 11.0 and fails with "symbol(s) not found for architecture arm64".
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
 
