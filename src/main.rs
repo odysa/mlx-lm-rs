@@ -22,6 +22,7 @@ use mlx_lm_rs::{
     generate::Generator,
     loader::{list_weight_files, resolve_model_dir},
     models::qwen3::Model,
+    server::{serve, ServeConfig},
     stats::{fmt_peak_memory, fmt_throughput, peak_memory_bytes, reset_peak_memory},
     tokenizer::load_tokenizer,
 };
@@ -63,9 +64,29 @@ enum Cmd {
         #[arg(long)]
         no_stream: bool,
     },
+    /// Serve an OpenAI-compatible HTTP API.
+    Serve {
+        /// Local model directory or HF repo (e.g. mlx-community/Qwen3-4B-bf16).
+        #[arg(long, default_value = "mlx-community/Qwen3-4B-bf16")]
+        model: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+        #[arg(long, default_value_t = 0.0, value_parser = parse_temp)]
+        temp: f32,
+        #[arg(long, default_value = "2048")]
+        prefill_step_size: NonZeroUsize,
+        /// Skip applying the chat template (render messages as plain text).
+        #[arg(long)]
+        no_chat_template: bool,
+    },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Generate {
@@ -169,6 +190,26 @@ fn main() -> Result<()> {
                 eprintln!("{}", fmt_peak_memory(peak_memory_bytes()));
             }
             Ok(())
+        }
+        Cmd::Serve {
+            model,
+            host,
+            port,
+            max_tokens,
+            temp,
+            prefill_step_size,
+            no_chat_template,
+        } => {
+            serve(ServeConfig {
+                model,
+                host,
+                port,
+                default_max_tokens: max_tokens,
+                default_temperature: temp,
+                prefill_step_size,
+                no_chat_template,
+            })
+            .await
         }
     }
 }
