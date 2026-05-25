@@ -6,6 +6,7 @@ pub mod generate;
 pub mod loader;
 pub mod models;
 pub mod sample;
+pub mod server;
 pub mod stats;
 pub mod tokenizer;
 

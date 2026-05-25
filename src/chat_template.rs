@@ -73,8 +73,25 @@ impl ChatTemplate {
     }
 
     pub fn render(&self, user_prompt: &str, add_generation_prompt: bool) -> Result<String> {
+        self.render_messages(
+            &[ChatTemplateMessage {
+                role: "user".to_string(),
+                content: user_prompt.to_string(),
+            }],
+            add_generation_prompt,
+        )
+    }
+
+    pub fn render_messages(
+        &self,
+        messages: &[ChatTemplateMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
         let tmpl: Template<'_, '_> = self.env.get_template("chat")?;
-        let messages: Vec<Value> = vec![context! { role => "user", content => user_prompt }];
+        let messages: Vec<Value> = messages
+            .iter()
+            .map(|m| context! { role => m.role.as_str(), content => m.content.as_str() })
+            .collect();
         Ok(tmpl.render(context! {
             messages => messages,
             add_generation_prompt => add_generation_prompt,
@@ -84,4 +101,10 @@ impl ChatTemplate {
             unk_token => self.unk,
         })?)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatTemplateMessage {
+    pub role: String,
+    pub content: String,
 }

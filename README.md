@@ -15,7 +15,7 @@ replacement for `mlx-lm` — explicitly out of scope right now:
 - Sliding-window / `RotatingKVCache` (needed for Gemma2/Mistral)
 - Samplers beyond greedy + temperature (top-k, top-p, min-p, repetition penalty)
 - Speculative decoding, batched generation
-- HTTP/OpenAI-compatible server
+- Full OpenAI API parity beyond basic chat completions
 - LoRA / fine-tuning, GGUF, AWQ/GPTQ, distributed inference
 - Tool calling / structured output
 - Any model architecture other than Qwen3 dense
@@ -54,6 +54,53 @@ Useful flags:
 - `--no-chat-template` — skip Jinja chat template, use raw prompt
 - `--no-stream` — don't flush stdout per token (cheaper for non-interactive use)
 - `--no-stats` — suppress trailing prompt/gen tps + peak memory lines
+
+## OpenAI-compatible server
+
+```sh
+cargo run --release -- serve \
+    --model mlx-community/Qwen3-0.6B-bf16 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+Supported endpoints:
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+Basic chat completion:
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Qwen3-0.6B-bf16",
+    "messages": [{"role": "user", "content": "Write a haiku about Rust."}],
+    "max_tokens": 128,
+    "temperature": 0
+  }'
+```
+
+Streaming uses server-sent events:
+
+```sh
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Qwen3-0.6B-bf16",
+    "messages": [{"role": "user", "content": "Write a haiku about Rust."}],
+    "max_tokens": 128,
+    "stream": true
+  }'
+```
+
+The server handles one generation at a time. It supports text messages,
+`max_tokens` / `max_completion_tokens`, `temperature`, `stream`, and `n=1`.
+Requests above the server `--max-tokens` cap are rejected. Tool calling,
+JSON/schema-constrained output, stop sequences, and multimodal message parts are
+rejected explicitly for now.
 
 ## Bench
 
