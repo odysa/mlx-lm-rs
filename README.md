@@ -98,8 +98,9 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 The server handles one generation at a time. It supports text messages,
 `max_tokens` / `max_completion_tokens`, `temperature`, `stream`, and `n=1`.
-Tool calling, JSON/schema-constrained output, stop sequences, and multimodal
-message parts are rejected explicitly for now.
+Requests above the server `--max-tokens` cap are rejected. Tool calling,
+JSON/schema-constrained output, stop sequences, and multimodal message parts are
+rejected explicitly for now.
 
 ## Bench
 

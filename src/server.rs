@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    net::SocketAddr,
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -49,6 +48,7 @@ pub struct ServeConfig {
 #[derive(Clone)]
 struct AppState {
     model_id: String,
+    max_tokens_limit: usize,
     work_tx: mpsc::Sender<WorkItem>,
     ids: Arc<AtomicU64>,
 }
@@ -67,16 +67,19 @@ enum WorkItem {
 }
 
 pub async fn serve(cfg: ServeConfig) -> Result<()> {
-    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
-        .parse()
-        .context("parsing listen address")?;
+    let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
+        .await
+        .context("binding listener")?;
+    let addr = listener.local_addr().context("reading listener addr")?;
     let model_id = cfg.model.clone();
+    let max_tokens_limit = cfg.default_max_tokens;
     let (work_tx, work_rx) = mpsc::channel();
 
     spawn_model_worker(cfg, work_rx)?;
 
     let state = AppState {
         model_id,
+        max_tokens_limit,
         work_tx,
         ids: Arc::new(AtomicU64::new(1)),
     };
@@ -87,9 +90,6 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
         .with_state(state);
 
     eprintln!("[mlx-lm-rs] OpenAI-compatible server listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("binding listener")?;
     axum::serve(listener, app).await.context("serving http")
 }
 
@@ -144,7 +144,7 @@ fn init_worker(cfg: ServeConfig) -> Result<ModelWorker> {
             .map(|x| x.ids())
             .unwrap_or_default(),
         model_id: cfg.model,
-        default_max_tokens: cfg.default_max_tokens,
+        max_tokens_limit: cfg.default_max_tokens,
         default_temperature: cfg.default_temperature,
         prefill_step_size: cfg.prefill_step_size,
     })
@@ -178,7 +178,7 @@ struct ModelWorker {
     chat_template: Option<ChatTemplate>,
     eos_ids: Vec<u32>,
     model_id: String,
-    default_max_tokens: usize,
+    max_tokens_limit: usize,
     default_temperature: f32,
     prefill_step_size: NonZeroUsize,
 }
@@ -298,7 +298,7 @@ impl ModelWorker {
     }
 
     fn prepare(&self, req: ChatCompletionRequest) -> Result<GenerationPlan, ApiError> {
-        req.validate()?;
+        req.validate_for_server(self.max_tokens_limit)?;
         let messages = req.template_messages()?;
         let prompt = if let Some(template) = &self.chat_template {
             template
@@ -320,7 +320,7 @@ impl ModelWorker {
         Ok(GenerationPlan {
             prompt_tokens: prompt_ids.len(),
             prompt_ids,
-            max_tokens: req.max_tokens().unwrap_or(self.default_max_tokens),
+            max_tokens: req.max_tokens().unwrap_or(self.max_tokens_limit),
             temperature: req.temperature.unwrap_or(self.default_temperature),
         })
     }
@@ -412,7 +412,7 @@ async fn create_chat_completion(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    if let Err(e) = req.validate() {
+    if let Err(e) = req.validate_for_server(state.max_tokens_limit) {
         return e.into_response();
     }
 
@@ -535,8 +535,28 @@ impl ChatCompletionRequest {
         Ok(())
     }
 
+    fn validate_for_server(&self, max_tokens_limit: usize) -> Result<(), ApiError> {
+        self.validate()?;
+        self.validate_content()?;
+        if let Some(max_tokens) = self.max_tokens() {
+            if max_tokens > max_tokens_limit {
+                return Err(ApiError::bad_request(format!(
+                    "max_tokens/max_completion_tokens must be less than or equal to server limit {max_tokens_limit}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn max_tokens(&self) -> Option<usize> {
         self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    fn validate_content(&self) -> Result<(), ApiError> {
+        for message in &self.messages {
+            message.validate_content()?;
+        }
+        Ok(())
     }
 
     fn template_messages(&self) -> Result<Vec<ChatTemplateMessage>, ApiError> {
@@ -565,6 +585,10 @@ struct RequestMessage {
 }
 
 impl RequestMessage {
+    fn validate_content(&self) -> Result<(), ApiError> {
+        self.content_text().map(|_| ())
+    }
+
     fn content_text(&self) -> Result<String, ApiError> {
         match &self.content {
             MessageContent::Text(text) => Ok(text.clone()),
@@ -742,6 +766,15 @@ mod tests {
         }
     }
 
+    fn test_app_state(work_tx: mpsc::Sender<WorkItem>) -> AppState {
+        AppState {
+            model_id: "qwen".into(),
+            max_tokens_limit: 16,
+            work_tx,
+            ids: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     #[test]
     fn validates_minimal_chat_completion_request() {
         let req = request(json!({
@@ -808,6 +841,21 @@ mod tests {
             .expect_err("image parts are unsupported");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("image_url"));
+    }
+
+    #[test]
+    fn rejects_max_tokens_above_server_limit() {
+        let req = request(json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 17
+        }));
+
+        let err = req
+            .validate_for_server(16)
+            .expect_err("request should exceed server limit");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("server limit 16"));
     }
 
     #[test]
@@ -946,16 +994,35 @@ mod tests {
     #[tokio::test]
     async fn invalid_streaming_request_returns_bad_request_before_sse() {
         let (work_tx, work_rx) = mpsc::channel();
-        let state = AppState {
-            model_id: "qwen".into(),
-            work_tx: work_tx.clone(),
-            ids: Arc::new(AtomicU64::new(1)),
-        };
+        let state = test_app_state(work_tx.clone());
         let req = request(json!({
             "model": "qwen",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true,
             "n": 2
+        }));
+
+        let response = create_chat_completion(State(state), Json(req)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(work_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn invalid_streaming_content_returns_bad_request_before_sse() {
+        let (work_tx, work_rx) = mpsc::channel();
+        let state = test_app_state(work_tx.clone());
+        let req = request(json!({
+            "model": "qwen",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                    ]
+                }
+            ],
+            "stream": true
         }));
 
         let response = create_chat_completion(State(state), Json(req)).await;
