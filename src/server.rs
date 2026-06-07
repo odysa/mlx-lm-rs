@@ -1,1033 +1,626 @@
 use std::{
-    convert::Infallible,
+    collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
-    },
+    path::{Path, PathBuf},
+    sync::mpsc as std_mpsc,
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
-    routing::{get, post},
-    Json, Router,
+use anyhow::{bail, Context, Result};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle as TokioJoinHandle;
+use tokio_util::sync::CancellationToken;
+use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+use vllm_engine_core_client::protocol::utility::{
+    UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use vllm_engine_core_client::protocol::{
+    encode_msgpack, EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
+    EngineCoreRequestType, EngineCoreSamplingParams, ModelDtype, StopReason,
+};
+use vllm_engine_core_client::{EngineId, TransportMode};
+use vllm_server::{
+    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
+    RendererSelection,
+};
+use zeromq::{
+    prelude::{Socket, SocketRecv, SocketSend},
+    util::PeerIdentity,
+    DealerSocket, PushSocket, SocketOptions, ZmqMessage,
+};
 
 use crate::{
-    chat_template::{ChatTemplate, ChatTemplateMessage},
     config::load_config,
     generate::Generator,
     loader::{list_weight_files, resolve_model_dir},
     models::qwen3::Model,
-    tokenizer::load_tokenizer,
 };
+
+const ENGINE_INDEX: u32 = 0;
 
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
     pub model: String,
     pub host: String,
     pub port: u16,
-    pub default_max_tokens: usize,
-    pub default_temperature: f32,
     pub prefill_step_size: NonZeroUsize,
-    pub no_chat_template: bool,
 }
 
-#[derive(Clone)]
-struct AppState {
-    model_id: String,
-    max_tokens_limit: usize,
-    work_tx: mpsc::Sender<WorkItem>,
-    ids: Arc<AtomicU64>,
+#[derive(Debug)]
+struct GenerateRequest {
+    prompt_tokens: Vec<u32>,
+    temperature: f32,
+    ignore_eos: bool,
+    max_tokens: usize,
+    token_tx: mpsc::UnboundedSender<TokenEvent>,
 }
 
-enum WorkItem {
-    Chat {
-        request_id: String,
-        req: ChatCompletionRequest,
-        response_tx: oneshot::Sender<Result<ChatCompletionResponse, ApiError>>,
-    },
-    ChatStream {
-        request_id: String,
-        req: ChatCompletionRequest,
-        chunk_tx: tokio_mpsc::Sender<Result<StreamItem, ApiError>>,
-    },
+#[derive(Debug)]
+enum TokenEvent {
+    Token(u32),
+    Finished { reason: EngineCoreFinishReason },
+    Error { message: String },
+}
+
+struct EngineHandle {
+    submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+}
+
+impl EngineHandle {
+    fn submit(&self, req: GenerateRequest) -> Result<()> {
+        self.submit_tx
+            .send(req)
+            .map_err(|_| anyhow::anyhow!("model worker is not running"))
+    }
 }
 
 pub async fn serve(cfg: ServeConfig) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((cfg.host.as_str(), cfg.port))
-        .await
-        .context("binding listener")?;
-    let addr = listener.local_addr().context("reading listener addr")?;
-    let model_id = cfg.model.clone();
-    let max_tokens_limit = cfg.default_max_tokens;
-    let (work_tx, work_rx) = mpsc::channel();
+    let model_dir = resolve_model_dir(&cfg.model).context("resolving model dir")?;
+    eprintln!("[mlx-lm-rs] using model dir: {}", model_dir.display());
 
-    spawn_model_worker(cfg, work_rx)?;
+    let model_cfg = load_config(&model_dir).context("loading config.json")?;
+    let max_model_len = u32::try_from(model_cfg.max_position_embeddings)
+        .ok()
+        .filter(|len| *len > 0)
+        .unwrap_or(4096);
+    let handle = spawn_model_worker(model_dir.clone(), cfg.prefill_step_size)?;
 
-    let state = AppState {
-        model_id,
-        max_tokens_limit,
-        work_tx,
-        ids: Arc::new(AtomicU64::new(1)),
-    };
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(create_chat_completion))
-        .with_state(state);
-
-    eprintln!("[mlx-lm-rs] OpenAI-compatible server listening on http://{addr}");
-    axum::serve(listener, app).await.context("serving http")
+    let shutdown = shutdown_token_from_ctrl_c();
+    serve_vllm_frontend(
+        handle,
+        cfg.model,
+        model_dir,
+        cfg.host,
+        cfg.port,
+        max_model_len,
+        shutdown,
+    )
+    .await
 }
 
-fn spawn_model_worker(cfg: ServeConfig, work_rx: mpsc::Receiver<WorkItem>) -> Result<()> {
-    let (init_tx, init_rx) = mpsc::channel::<std::result::Result<(), String>>();
-    thread::Builder::new()
+fn spawn_model_worker(model_dir: PathBuf, prefill_step_size: NonZeroUsize) -> Result<EngineHandle> {
+    let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<std::result::Result<(), String>>();
+
+    let join_handle = thread::Builder::new()
         .name("mlx-lm-rs-model-worker".into())
-        .spawn(move || match init_worker(cfg) {
-            Ok(mut worker) => {
-                let _ = init_tx.send(Ok(()));
-                run_worker_loop(&mut worker, work_rx);
+        .spawn(move || match init_model_worker(&model_dir) {
+            Ok((mut model, eos_ids)) => {
+                let _ = ready_tx.send(Ok(()));
+                while let Some(req) = submit_rx.blocking_recv() {
+                    run_generation(&mut model, &eos_ids, prefill_step_size, req);
+                }
             }
-            Err(e) => {
-                let message = format!("{e:#}");
-                let _ = init_tx.send(Err(message.clone()));
+            Err(error) => {
+                let message = format!("{error:#}");
+                let _ = ready_tx.send(Err(message.clone()));
                 eprintln!("[mlx-lm-rs] model worker failed to initialize: {message}");
             }
         })
         .context("spawning model worker")?;
 
-    match init_rx.recv().context("waiting for model worker startup")? {
-        Ok(()) => Ok(()),
+    match ready_rx
+        .recv()
+        .context("waiting for model worker startup")?
+    {
+        Ok(()) => {
+            drop(join_handle);
+            Ok(EngineHandle { submit_tx })
+        }
         Err(message) => anyhow::bail!("model worker failed to initialize: {message}"),
     }
 }
 
-fn init_worker(cfg: ServeConfig) -> Result<ModelWorker> {
-    let model_dir = resolve_model_dir(&cfg.model).context("resolving model dir")?;
-    eprintln!("[mlx-lm-rs] using model dir: {}", model_dir.display());
+fn init_model_worker(model_dir: &Path) -> Result<(Model, Vec<u32>)> {
+    let model_cfg = load_config(model_dir).context("loading config.json")?;
+    let eos_ids = model_cfg
+        .eos_token_id
+        .as_ref()
+        .map(|x| x.ids())
+        .unwrap_or_default();
 
-    let model_cfg = load_config(&model_dir).context("loading config.json")?;
-    let tokenizer = load_tokenizer(&model_dir).context("loading tokenizer.json")?;
-    let chat_template = if cfg.no_chat_template {
-        None
-    } else {
-        ChatTemplate::load(&model_dir).context("loading chat template")?
-    };
-
-    let mut model = Model::new(model_cfg.clone()).context("constructing model")?;
-    let shards = list_weight_files(&model_dir).context("listing weight files")?;
+    let mut model = Model::new(model_cfg).context("constructing model")?;
+    let shards = list_weight_files(model_dir).context("listing weight files")?;
     eprintln!("[mlx-lm-rs] loading {} weight shard(s)...", shards.len());
     model.load_weights(&shards).context("loading weights")?;
-    eprintln!("[mlx-lm-rs] weights loaded; accepting requests");
+    eprintln!("[mlx-lm-rs] weights loaded; accepting vLLM requests");
 
-    Ok(ModelWorker {
-        model,
-        tokenizer,
-        chat_template,
-        eos_ids: model_cfg
-            .eos_token_id
-            .as_ref()
-            .map(|x| x.ids())
-            .unwrap_or_default(),
-        model_id: cfg.model,
-        max_tokens_limit: cfg.default_max_tokens,
-        default_temperature: cfg.default_temperature,
-        prefill_step_size: cfg.prefill_step_size,
-    })
+    Ok((model, eos_ids))
 }
 
-fn run_worker_loop(worker: &mut ModelWorker, work_rx: mpsc::Receiver<WorkItem>) {
-    for item in work_rx {
-        match item {
-            WorkItem::Chat {
-                request_id,
-                req,
-                response_tx,
-            } => {
-                let response = worker.complete_chat(&request_id, req);
-                let _ = response_tx.send(response);
+fn run_generation(
+    model: &mut Model,
+    eos_ids: &[u32],
+    prefill_step_size: NonZeroUsize,
+    req: GenerateRequest,
+) {
+    let mut completion_tokens = 0usize;
+    let max_tokens = req.max_tokens;
+    let temperature = req.temperature;
+    let request_eos_ids = if req.ignore_eos { &[] } else { eos_ids };
+    let result = (|| -> crate::Result<EngineCoreFinishReason> {
+        let mut generator = Generator::new(
+            model,
+            &req.prompt_tokens,
+            max_tokens,
+            temperature,
+            request_eos_ids.to_vec(),
+            prefill_step_size,
+        )?;
+
+        for token in &mut generator {
+            let id = token?;
+            completion_tokens += 1;
+            if req.token_tx.send(TokenEvent::Token(id)).is_err() {
+                return Ok(EngineCoreFinishReason::Error);
             }
-            WorkItem::ChatStream {
-                request_id,
-                req,
-                chunk_tx,
-            } => {
-                worker.stream_chat(&request_id, req, chunk_tx);
-            }
+        }
+
+        Ok(if completion_tokens >= max_tokens && max_tokens > 0 {
+            EngineCoreFinishReason::Length
+        } else {
+            EngineCoreFinishReason::Stop
+        })
+    })();
+
+    match result {
+        Ok(reason) => {
+            let _ = req.token_tx.send(TokenEvent::Finished { reason });
+        }
+        Err(error) => {
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: format!("{error:#}"),
+            });
         }
     }
 }
 
-struct ModelWorker {
-    model: Model,
-    tokenizer: tokenizers::Tokenizer,
-    chat_template: Option<ChatTemplate>,
-    eos_ids: Vec<u32>,
-    model_id: String,
-    max_tokens_limit: usize,
-    default_temperature: f32,
-    prefill_step_size: NonZeroUsize,
+struct LocalEngineBridge {
+    input_address: String,
+    output_address: String,
+    handle: EngineHandle,
+    max_model_len: u32,
 }
 
-impl ModelWorker {
-    fn complete_chat(
-        &mut self,
-        request_id: &str,
-        req: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, ApiError> {
-        let created = unix_timestamp();
-        let plan = self.prepare(req)?;
-        let generation = self.generate_text(&plan)?;
-        let finish_reason = finish_reason(generation.completion_tokens, plan.max_tokens);
+impl LocalEngineBridge {
+    async fn run(self, shutdown: CancellationToken) -> Result<()> {
+        wait_for_ipc_endpoint(&self.input_address, &shutdown).await?;
+        wait_for_ipc_endpoint(&self.output_address, &shutdown).await?;
 
-        Ok(ChatCompletionResponse {
-            id: request_id.to_string(),
-            object: "chat.completion",
-            created,
-            model: self.model_id.clone(),
-            choices: vec![ChatCompletionChoice {
-                index: 0,
-                message: AssistantMessage {
-                    role: "assistant",
-                    content: generation.text,
-                },
-                finish_reason,
-            }],
-            usage: Usage {
-                prompt_tokens: plan.prompt_tokens,
-                completion_tokens: generation.completion_tokens,
-                total_tokens: plan.prompt_tokens + generation.completion_tokens,
-            },
-        })
-    }
+        let engine_id = EngineId::from_engine_index(ENGINE_INDEX);
+        let mut socket_options = SocketOptions::default();
+        socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
 
-    fn stream_chat(
-        &mut self,
-        request_id: &str,
-        req: ChatCompletionRequest,
-        chunk_tx: tokio_mpsc::Sender<Result<StreamItem, ApiError>>,
-    ) {
-        let created = unix_timestamp();
-        let result = self.prepare(req).and_then(|plan| {
-            let mut completion_tokens = 0usize;
-            let first = ChatCompletionChunk {
-                id: request_id.to_string(),
-                object: "chat.completion.chunk",
-                created,
-                model: self.model_id.clone(),
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: DeltaMessage {
-                        role: Some("assistant"),
-                        content: Some(String::new()),
-                    },
-                    finish_reason: None,
-                }],
-            };
-            send_stream_item(&chunk_tx, Ok(StreamItem::Chunk(first)))?;
+        let mut input = DealerSocket::with_options(socket_options);
+        input
+            .connect(&self.input_address)
+            .await
+            .with_context(|| format!("connecting local engine input {}", self.input_address))?;
 
-            let mut gen = Generator::new(
-                &mut self.model,
-                &plan.prompt_ids,
-                plan.max_tokens,
-                plan.temperature,
-                self.eos_ids.clone(),
-                self.prefill_step_size,
-            )
-            .map_err(ApiError::internal)?;
-            let mut decode = self.tokenizer.decode_stream(false);
+        let ready = EngineCoreReadyResponse {
+            max_model_len: self.max_model_len as u64,
+            num_gpu_blocks: 0,
+            dp_stats_address: None,
+            dtype: ModelDtype::BFloat16,
+            vllm_version: "mlx-lm-rs-local-bridge".to_string(),
+        };
+        input
+            .send(ZmqMessage::from(encode_msgpack(&ready)?))
+            .await
+            .context("sending local engine ready response")?;
 
-            for tok in &mut gen {
-                let tok = tok.map_err(ApiError::internal)?;
-                completion_tokens += 1;
-                if let Some(text) = decode.step(tok).map_err(ApiError::internal)? {
-                    let chunk = ChatCompletionChunk {
-                        id: request_id.to_string(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: self.model_id.clone(),
-                        choices: vec![ChatCompletionChunkChoice {
-                            index: 0,
-                            delta: DeltaMessage {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    send_stream_item(&chunk_tx, Ok(StreamItem::Chunk(chunk)))?;
+        let mut output = PushSocket::new();
+        output
+            .connect(&self.output_address)
+            .await
+            .with_context(|| format!("connecting local engine output {}", self.output_address))?;
+
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let output_task = tokio::spawn(output_loop(output, output_rx));
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
+        let mut active: HashMap<String, TokioJoinHandle<()>> = HashMap::new();
+
+        eprintln!(
+            "[mlx-lm-rs] local vLLM engine bridge connected: max_model_len={}",
+            self.max_model_len
+        );
+
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                Some(request_id) = done_rx.recv() => {
+                    active.remove(&request_id);
+                }
+                recv = input.recv() => {
+                    let message = recv.context("receiving local engine request")?;
+                    if let Err(error) = self.handle_message(
+                        message,
+                        &output_tx,
+                        &done_tx,
+                        &mut active,
+                    ) {
+                        eprintln!("[mlx-lm-rs] local engine bridge request failed: {error:#}");
+                    }
                 }
             }
+        }
 
-            let final_chunk = ChatCompletionChunk {
-                id: request_id.to_string(),
-                object: "chat.completion.chunk",
-                created,
-                model: self.model_id.clone(),
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: DeltaMessage {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some(finish_reason(completion_tokens, plan.max_tokens)),
-                }],
-            };
-            send_stream_item(&chunk_tx, Ok(StreamItem::Chunk(final_chunk)))?;
-            send_stream_item(&chunk_tx, Ok(StreamItem::Done))?;
-            Ok(())
-        });
+        for (_, task) in active {
+            task.abort();
+        }
+        drop(output_tx);
+        output_task.abort();
+        Ok(())
+    }
 
-        if let Err(e) = result {
-            let _ = chunk_tx.blocking_send(Err(e));
+    fn handle_message(
+        &self,
+        message: ZmqMessage,
+        output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+        done_tx: &mpsc::UnboundedSender<String>,
+        active: &mut HashMap<String, TokioJoinHandle<()>>,
+    ) -> Result<()> {
+        let frames = message.into_vec();
+        if frames.len() != 2 {
+            bail!(
+                "expected 2 local engine request frames, got {}",
+                frames.len()
+            );
+        }
+
+        match frames[0].as_ref() {
+            ty if ty == EngineCoreRequestType::Add.to_frame().as_ref() => {
+                let request: EngineCoreRequest =
+                    vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
+                self.start_request(request, output_tx, done_tx, active)
+            }
+            ty if ty == EngineCoreRequestType::Abort.to_frame().as_ref() => {
+                let request_ids: Vec<String> =
+                    vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
+                for request_id in request_ids {
+                    if let Some(task) = active.remove(&request_id) {
+                        task.abort();
+                    }
+                }
+                Ok(())
+            }
+            ty if ty == EngineCoreRequestType::Utility.to_frame().as_ref() => {
+                let (_client_index, call_id, method_name, _args): (
+                    u32,
+                    UtilityCallId,
+                    String,
+                    rmpv::Value,
+                ) = rmp_serde::from_slice(&frames[1])?;
+                send_utility_response(output_tx, call_id, &method_name)
+            }
+            other => bail!("unsupported local engine request type frame: {other:?}"),
         }
     }
 
-    fn prepare(&self, req: ChatCompletionRequest) -> Result<GenerationPlan, ApiError> {
-        req.validate_for_server(self.max_tokens_limit)?;
-        let messages = req.template_messages()?;
-        let prompt = if let Some(template) = &self.chat_template {
-            template
-                .render_messages(&messages, true)
-                .map_err(ApiError::internal)?
-        } else {
-            render_plain_prompt(&messages)
+    fn start_request(
+        &self,
+        request: EngineCoreRequest,
+        output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+        done_tx: &mpsc::UnboundedSender<String>,
+        active: &mut HashMap<String, TokioJoinHandle<()>>,
+    ) -> Result<()> {
+        let EngineCoreRequest {
+            request_id,
+            prompt_token_ids,
+            sampling_params,
+            ..
+        } = request;
+        let Some(prompt_tokens) = prompt_token_ids else {
+            send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
+            return Ok(());
         };
-        let add_special_tokens = self.chat_template.is_none();
-        let encoding = self
-            .tokenizer
-            .encode(prompt.as_str(), add_special_tokens)
-            .map_err(ApiError::internal)?;
-        let prompt_ids = encoding.get_ids().to_vec();
-        if prompt_ids.is_empty() {
-            return Err(ApiError::bad_request("empty prompt"));
-        }
+        let Some(sampling_params) = sampling_params else {
+            send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
+            return Ok(());
+        };
 
-        Ok(GenerationPlan {
-            prompt_tokens: prompt_ids.len(),
-            prompt_ids,
-            max_tokens: req.max_tokens().unwrap_or(self.max_tokens_limit),
-            temperature: req.temperature.unwrap_or(self.default_temperature),
-        })
+        let max_tokens = sampling_params.max_tokens as usize;
+        let temperature = sampling_temperature(&sampling_params);
+        let ignore_eos = ignore_eos(&sampling_params);
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        self.handle.submit(GenerateRequest {
+            prompt_tokens,
+            temperature,
+            ignore_eos,
+            max_tokens,
+            token_tx,
+        })?;
+
+        let output_tx = output_tx.clone();
+        let done_tx = done_tx.clone();
+        let task_request_id = request_id.clone();
+        let task = tokio::spawn(async move {
+            run_request_stream(task_request_id.clone(), token_rx, output_tx).await;
+            let _ = done_tx.send(task_request_id);
+        });
+        active.insert(request_id, task);
+        Ok(())
     }
+}
 
-    fn generate_text(&mut self, plan: &GenerationPlan) -> Result<GenerationResult, ApiError> {
-        let mut gen = Generator::new(
-            &mut self.model,
-            &plan.prompt_ids,
-            plan.max_tokens,
-            plan.temperature,
-            self.eos_ids.clone(),
-            self.prefill_step_size,
-        )
-        .map_err(ApiError::internal)?;
+async fn serve_vllm_frontend(
+    handle: EngineHandle,
+    model_id: String,
+    model_dir: PathBuf,
+    host: String,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let namespace = local_ipc_namespace()?;
+    let input_address = ipc_endpoint(&namespace, "input.sock");
+    let output_address = ipc_endpoint(&namespace, "output.sock");
 
-        let mut decode = self.tokenizer.decode_stream(false);
-        let mut text = String::new();
-        let mut completion_tokens = 0usize;
-        for tok in &mut gen {
-            let tok = tok.map_err(ApiError::internal)?;
-            completion_tokens += 1;
-            if let Some(piece) = decode.step(tok).map_err(ApiError::internal)? {
-                text.push_str(&piece);
+    let bridge = LocalEngineBridge {
+        input_address: input_address.clone(),
+        output_address: output_address.clone(),
+        handle,
+        max_model_len,
+    };
+    let bridge_shutdown = shutdown.child_token();
+    let bridge_task = tokio::spawn(async move {
+        if let Err(error) = bridge.run(bridge_shutdown).await {
+            eprintln!("[mlx-lm-rs] local vLLM engine bridge exited: {error:#}");
+        }
+    });
+
+    let served_model_name = vec![model_id.clone()];
+    let config = Config {
+        transport_mode: TransportMode::Bootstrapped {
+            input_address,
+            output_address,
+            engine_count: 1,
+            ready_timeout: Duration::from_secs(30),
+        },
+        coordinator_mode: CoordinatorMode::None,
+        model: model_dir.to_string_lossy().into_owned(),
+        served_model_name,
+        listener_mode: HttpListenerMode::BindTcp { host, port },
+        tool_call_parser: ParserSelection::default(),
+        reasoning_parser: ParserSelection::default(),
+        renderer: RendererSelection::default(),
+        chat_template: None,
+        default_chat_template_kwargs: None,
+        chat_template_content_format: ChatTemplateContentFormatOption::default(),
+        enable_log_requests: true,
+        enable_request_id_headers: false,
+        disable_log_stats: true,
+        grpc_port: None,
+        shutdown_timeout: Duration::from_secs(10),
+    };
+
+    let result = vllm_server::serve(config, shutdown).await;
+    bridge_task.abort();
+    let _ = std::fs::remove_dir_all(namespace);
+    result
+}
+
+async fn run_request_stream(
+    request_id: String,
+    mut token_rx: mpsc::UnboundedReceiver<TokenEvent>,
+    output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+) {
+    while let Some(event) = token_rx.recv().await {
+        match event {
+            TokenEvent::Token(id) => {
+                if send_token_output(&output_tx, &request_id, vec![id]).is_err() {
+                    return;
+                }
+            }
+            TokenEvent::Finished { reason } => {
+                let _ = send_terminal_output(&output_tx, request_id, reason, None);
+                return;
+            }
+            TokenEvent::Error { message } => {
+                eprintln!("[mlx-lm-rs] request {request_id} failed: {message}");
+                let _ = send_terminal_output(
+                    &output_tx,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                    Some(StopReason::Text(message)),
+                );
+                return;
             }
         }
-
-        Ok(GenerationResult {
-            text,
-            completion_tokens,
-        })
     }
 }
 
-fn send_stream_item(
-    chunk_tx: &tokio_mpsc::Sender<Result<StreamItem, ApiError>>,
-    item: Result<StreamItem, ApiError>,
-) -> Result<(), ApiError> {
-    chunk_tx
-        .blocking_send(item)
-        .map_err(|_| ApiError::internal("client disconnected"))
+async fn output_loop(
+    mut output: PushSocket,
+    mut output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+) -> Result<()> {
+    while let Some(outputs) = output_rx.recv().await {
+        output
+            .send(ZmqMessage::from(encode_msgpack(&outputs)?))
+            .await
+            .context("sending local engine output")?;
+    }
+    Ok(())
 }
 
-fn finish_reason(completion_tokens: usize, max_tokens: usize) -> &'static str {
-    if completion_tokens >= max_tokens && max_tokens > 0 {
-        "length"
+fn send_token_output(
+    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+    request_id: &str,
+    token_ids: Vec<u32>,
+) -> Result<()> {
+    send_outputs(
+        output_tx,
+        EngineCoreOutputs {
+            engine_index: ENGINE_INDEX,
+            outputs: vec![engine_output(request_id.to_string(), token_ids, None, None)],
+            timestamp: now_secs_f64(),
+            ..Default::default()
+        },
+    )
+}
+
+fn send_terminal_output(
+    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+    request_id: String,
+    finish_reason: EngineCoreFinishReason,
+    stop_reason: Option<StopReason>,
+) -> Result<()> {
+    send_outputs(
+        output_tx,
+        EngineCoreOutputs {
+            engine_index: ENGINE_INDEX,
+            outputs: vec![engine_output(
+                request_id.clone(),
+                Vec::new(),
+                Some(finish_reason),
+                stop_reason,
+                None,
+            )],
+            finished_requests: Some(BTreeSet::from([request_id])),
+            timestamp: now_secs_f64(),
+            ..Default::default()
+        },
+    )
+}
+
+fn send_utility_response(
+    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+    call_id: UtilityCallId,
+    method_name: &str,
+) -> Result<()> {
+    let result = match method_name {
+        "is_sleeping" | "reset_prefix_cache" => rmpv::ext::to_value(false)?,
+        "sleep" | "wake_up" | "reset_mm_cache" | "reset_encoder_cache" | "collective_rpc" => {
+            rmpv::Value::Nil
+        }
+        _ => rmpv::Value::Nil,
+    };
+
+    send_outputs(
+        output_tx,
+        EngineCoreOutputs {
+            engine_index: ENGINE_INDEX,
+            utility_output: Some(UtilityOutput {
+                call_id,
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(result)),
+            }),
+            timestamp: now_secs_f64(),
+            ..Default::default()
+        },
+    )
+}
+
+fn send_outputs(
+    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+    outputs: EngineCoreOutputs,
+) -> Result<()> {
+    output_tx
+        .send(outputs)
+        .map_err(|_| anyhow::anyhow!("local engine output channel closed"))
+}
+
+fn engine_output(
+    request_id: String,
+    new_token_ids: Vec<u32>,
+    finish_reason: Option<EngineCoreFinishReason>,
+    stop_reason: Option<StopReason>,
+) -> EngineCoreOutput {
+    EngineCoreOutput {
+        request_id,
+        new_token_ids,
+        new_logprobs: None,
+        new_prompt_logprobs_tensors: None,
+        pooling_output: None,
+        finish_reason,
+        stop_reason,
+        events: None,
+        kv_transfer_params: None,
+        trace_headers: None,
+        prefill_stats: None,
+        routed_experts: None,
+        num_nans_in_logits: 0,
+    }
+}
+
+fn sampling_temperature(params: &EngineCoreSamplingParams) -> f32 {
+    if params.temperature <= 0.0 {
+        0.0
     } else {
-        "stop"
+        params.temperature
     }
 }
 
-fn render_plain_prompt(messages: &[ChatTemplateMessage]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        out.push_str(&m.role);
-        out.push_str(": ");
-        out.push_str(&m.content);
-        out.push('\n');
-    }
-    out.push_str("assistant: ");
-    out
+fn ignore_eos(params: &EngineCoreSamplingParams) -> bool {
+    params.eos_token_id.is_none() && params.stop_token_ids.is_empty()
 }
 
-fn unix_timestamp() -> u64 {
+fn now_secs_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_secs_f64()
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+fn local_ipc_namespace() -> Result<PathBuf> {
+    let base_dir =
+        std::env::var_os("MLX_LM_RS_IPC_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let path = base_dir.join(format!("mlx-lm-rs-{}-{}", std::process::id(), &uuid[..8]));
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("creating IPC namespace {}", path.display()))?;
+    Ok(path)
 }
 
-async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "object": "list",
-        "data": [
-            {
-                "id": state.model_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "mlx-lm-rs"
-            }
-        ]
-    }))
+fn ipc_endpoint(namespace: &Path, name: &str) -> String {
+    format!("ipc://{}", namespace.join(name).to_string_lossy())
 }
 
-async fn create_chat_completion(
-    State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Response {
-    if let Err(e) = req.validate_for_server(state.max_tokens_limit) {
-        return e.into_response();
-    }
-
-    let request_id = format!(
-        "chatcmpl-{}-{}",
-        unix_timestamp(),
-        state.ids.fetch_add(1, Ordering::Relaxed)
-    );
-
-    if req.stream.unwrap_or(false) {
-        let (chunk_tx, chunk_rx) = tokio_mpsc::channel(16);
-        if state
-            .work_tx
-            .send(WorkItem::ChatStream {
-                request_id,
-                req,
-                chunk_tx,
-            })
-            .is_err()
-        {
-            return ApiError::internal("model worker is not running").into_response();
+async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> Result<()> {
+    let Some(path) = address.strip_prefix("ipc://") else {
+        return Ok(());
+    };
+    let path = Path::new(path);
+    loop {
+        if path.exists() {
+            return Ok(());
         }
-
-        let stream = ReceiverStream::new(chunk_rx).map(|item| match item {
-            Ok(StreamItem::Chunk(chunk)) => {
-                Ok::<Event, Infallible>(Event::default().json_data(chunk).unwrap())
-            }
-            Ok(StreamItem::Done) => Ok::<Event, Infallible>(Event::default().data("[DONE]")),
-            Err(e) => Ok::<Event, Infallible>(Event::default().json_data(e.error_body()).unwrap()),
-        });
-        Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response()
-    } else {
-        let (response_tx, response_rx) = oneshot::channel();
-        if state
-            .work_tx
-            .send(WorkItem::Chat {
-                request_id,
-                req,
-                response_tx,
-            })
-            .is_err()
-        {
-            return ApiError::internal("model worker is not running").into_response();
-        }
-
-        match response_rx.await {
-            Ok(Ok(response)) => Json(response).into_response(),
-            Ok(Err(e)) => e.into_response(),
-            Err(_) => ApiError::internal("model worker dropped request").into_response(),
+        tokio::select! {
+            () = shutdown.cancelled() => bail!("shutdown before IPC endpoint appeared"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<RequestMessage>,
-    #[serde(default)]
-    max_tokens: Option<usize>,
-    #[serde(default)]
-    max_completion_tokens: Option<usize>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    stream: Option<bool>,
-    #[serde(default)]
-    n: Option<usize>,
-    #[serde(default)]
-    stop: Option<Value>,
-    #[serde(default)]
-    tools: Option<Value>,
-    #[serde(default)]
-    tool_choice: Option<Value>,
-    #[serde(default)]
-    response_format: Option<ResponseFormat>,
-}
-
-impl ChatCompletionRequest {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.model.trim().is_empty() {
-            return Err(ApiError::bad_request("model is required"));
+fn shutdown_token_from_ctrl_c() -> CancellationToken {
+    let token = CancellationToken::new();
+    let shutdown = token.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("[mlx-lm-rs] failed to install CTRL+C handler: {error}");
         }
-        if self.messages.is_empty() {
-            return Err(ApiError::bad_request("messages must not be empty"));
-        }
-        if let Some(n) = self.n {
-            if n != 1 {
-                return Err(ApiError::bad_request("only n=1 is supported"));
-            }
-        }
-        if self.max_tokens().is_some_and(|x| x == 0) {
-            return Err(ApiError::bad_request(
-                "max_tokens/max_completion_tokens must be greater than 0",
-            ));
-        }
-        if let Some(temp) = self.temperature {
-            if !(temp == 0.0 || (temp.is_finite() && temp > 0.0)) {
-                return Err(ApiError::bad_request(
-                    "temperature must be 0.0 or a finite positive value",
-                ));
-            }
-        }
-        if self.stop.is_some() {
-            return Err(ApiError::bad_request(
-                "stop sequences are not supported yet",
-            ));
-        }
-        if self.tools.is_some() || self.tool_choice.is_some() {
-            return Err(ApiError::bad_request("tool calling is not supported yet"));
-        }
-        if let Some(format) = &self.response_format {
-            if format.kind != "text" {
-                return Err(ApiError::bad_request(
-                    "only response_format {\"type\":\"text\"} is supported",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_for_server(&self, max_tokens_limit: usize) -> Result<(), ApiError> {
-        self.validate()?;
-        self.validate_content()?;
-        if let Some(max_tokens) = self.max_tokens() {
-            if max_tokens > max_tokens_limit {
-                return Err(ApiError::bad_request(format!(
-                    "max_tokens/max_completion_tokens must be less than or equal to server limit {max_tokens_limit}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn max_tokens(&self) -> Option<usize> {
-        self.max_completion_tokens.or(self.max_tokens)
-    }
-
-    fn validate_content(&self) -> Result<(), ApiError> {
-        for message in &self.messages {
-            message.validate_content()?;
-        }
-        Ok(())
-    }
-
-    fn template_messages(&self) -> Result<Vec<ChatTemplateMessage>, ApiError> {
-        self.messages
-            .iter()
-            .map(|m| {
-                Ok(ChatTemplateMessage {
-                    role: m.role.clone(),
-                    content: m.content_text()?,
-                })
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseFormat {
-    #[serde(rename = "type")]
-    kind: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RequestMessage {
-    role: String,
-    content: MessageContent,
-}
-
-impl RequestMessage {
-    fn validate_content(&self) -> Result<(), ApiError> {
-        self.content_text().map(|_| ())
-    }
-
-    fn content_text(&self) -> Result<String, ApiError> {
-        match &self.content {
-            MessageContent::Text(text) => Ok(text.clone()),
-            MessageContent::Parts(parts) => {
-                let mut text = String::new();
-                for part in parts {
-                    match part.kind.as_str() {
-                        "text" => {
-                            let Some(part_text) = &part.text else {
-                                return Err(ApiError::bad_request(
-                                    "text content parts require a text field",
-                                ));
-                            };
-                            text.push_str(part_text);
-                        }
-                        other => {
-                            return Err(ApiError::bad_request(format!(
-                                "content part type {other:?} is not supported"
-                            )));
-                        }
-                    }
-                }
-                Ok(text)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum MessageContent {
-    Text(String),
-    Parts(Vec<MessageContentPart>),
-}
-
-#[derive(Debug, Deserialize)]
-struct MessageContentPart {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-struct GenerationPlan {
-    prompt_ids: Vec<u32>,
-    prompt_tokens: usize,
-    max_tokens: usize,
-    temperature: f32,
-}
-
-struct GenerationResult {
-    text: String,
-    completion_tokens: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionResponse {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: String,
-    choices: Vec<ChatCompletionChoice>,
-    usage: Usage,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionChoice {
-    index: usize,
-    message: AssistantMessage,
-    finish_reason: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct AssistantMessage {
-    role: &'static str,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct Usage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-}
-
-enum StreamItem {
-    Chunk(ChatCompletionChunk),
-    Done,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionChunk {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: String,
-    choices: Vec<ChatCompletionChunkChoice>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionChunkChoice {
-    index: usize,
-    delta: DeltaMessage,
-    finish_reason: Option<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-struct DeltaMessage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.to_string(),
-        }
-    }
-
-    fn error_body(&self) -> Value {
-        json!({
-            "error": {
-                "message": self.message,
-                "type": if self.status == StatusCode::BAD_REQUEST {
-                    "invalid_request_error"
-                } else {
-                    "server_error"
-                },
-                "code": null
-            }
-        })
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.status, Json(self.error_body())).into_response()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn request(value: Value) -> ChatCompletionRequest {
-        serde_json::from_value(value).expect("valid request json")
-    }
-
-    fn test_serve_config(model: String) -> ServeConfig {
-        ServeConfig {
-            model,
-            host: "127.0.0.1".into(),
-            port: 0,
-            default_max_tokens: 16,
-            default_temperature: 0.0,
-            prefill_step_size: NonZeroUsize::new(2048).unwrap(),
-            no_chat_template: false,
-        }
-    }
-
-    fn test_app_state(work_tx: mpsc::Sender<WorkItem>) -> AppState {
-        AppState {
-            model_id: "qwen".into(),
-            max_tokens_limit: 16,
-            work_tx,
-            ids: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    #[test]
-    fn validates_minimal_chat_completion_request() {
-        let req = request(json!({
-            "model": "mlx-community/Qwen3-0.6B-bf16",
-            "messages": [{"role": "user", "content": "hello"}]
-        }));
-
-        req.validate().expect("request should validate");
-        assert_eq!(req.max_tokens(), None);
-
-        let messages = req.template_messages().expect("template messages");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "hello");
-    }
-
-    #[test]
-    fn max_completion_tokens_takes_precedence_over_max_tokens() {
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 10,
-            "max_completion_tokens": 20
-        }));
-
-        assert_eq!(req.max_tokens(), Some(20));
-    }
-
-    #[test]
-    fn accepts_text_content_parts() {
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hello"},
-                        {"type": "text", "text": " world"}
-                    ]
-                }
-            ]
-        }));
-
-        let messages = req.template_messages().expect("template messages");
-        assert_eq!(messages[0].content, "hello world");
-    }
-
-    #[test]
-    fn rejects_unsupported_multimodal_content_parts() {
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
-                    ]
-                }
-            ]
-        }));
-
-        let err = req
-            .template_messages()
-            .expect_err("image parts are unsupported");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("image_url"));
-    }
-
-    #[test]
-    fn rejects_max_tokens_above_server_limit() {
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 17
-        }));
-
-        let err = req
-            .validate_for_server(16)
-            .expect_err("request should exceed server limit");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("server limit 16"));
-    }
-
-    #[test]
-    fn rejects_unsupported_openai_options_explicitly() {
-        let cases = [
-            (
-                json!({
-                    "model": "qwen",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "n": 2
-                }),
-                "only n=1",
-            ),
-            (
-                json!({
-                    "model": "qwen",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "temperature": -1
-                }),
-                "temperature",
-            ),
-            (
-                json!({
-                    "model": "qwen",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "stop": ["END"]
-                }),
-                "stop sequences",
-            ),
-            (
-                json!({
-                    "model": "qwen",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "tools": []
-                }),
-                "tool calling",
-            ),
-            (
-                json!({
-                    "model": "qwen",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "response_format": {"type": "json_object"}
-                }),
-                "response_format",
-            ),
-        ];
-
-        for (value, expected) in cases {
-            let req = request(value);
-            let err = req.validate().expect_err("request should be rejected");
-            assert_eq!(err.status, StatusCode::BAD_REQUEST);
-            assert!(
-                err.message.contains(expected),
-                "expected {expected:?} in {:?}",
-                err.message
-            );
-        }
-    }
-
-    #[test]
-    fn renders_plain_prompt_when_template_is_disabled() {
-        let prompt = render_plain_prompt(&[
-            ChatTemplateMessage {
-                role: "system".into(),
-                content: "Be terse.".into(),
-            },
-            ChatTemplateMessage {
-                role: "user".into(),
-                content: "Ping".into(),
-            },
-        ]);
-
-        assert_eq!(prompt, "system: Be terse.\nuser: Ping\nassistant: ");
-    }
-
-    #[test]
-    fn finish_reason_reports_length_only_when_cap_is_hit() {
-        assert_eq!(finish_reason(10, 10), "length");
-        assert_eq!(finish_reason(9, 10), "stop");
-        assert_eq!(finish_reason(0, 0), "stop");
-    }
-
-    #[test]
-    fn serializes_chat_completion_response_shape() {
-        let response = ChatCompletionResponse {
-            id: "chatcmpl-test".into(),
-            object: "chat.completion",
-            created: 123,
-            model: "qwen".into(),
-            choices: vec![ChatCompletionChoice {
-                index: 0,
-                message: AssistantMessage {
-                    role: "assistant",
-                    content: "hello".into(),
-                },
-                finish_reason: "stop",
-            }],
-            usage: Usage {
-                prompt_tokens: 2,
-                completion_tokens: 3,
-                total_tokens: 5,
-            },
-        };
-
-        let value = serde_json::to_value(response).expect("serialize response");
-        assert_eq!(value["id"], "chatcmpl-test");
-        assert_eq!(value["object"], "chat.completion");
-        assert_eq!(value["choices"][0]["message"]["role"], "assistant");
-        assert_eq!(value["choices"][0]["message"]["content"], "hello");
-        assert_eq!(value["usage"]["total_tokens"], 5);
-    }
-
-    #[test]
-    fn model_worker_startup_reports_initialization_failure() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let model_dir = std::env::temp_dir().join(format!("mlx-lm-rs-empty-model-{unique}"));
-        std::fs::create_dir_all(&model_dir).expect("create temp model dir");
-
-        let (_work_tx, work_rx) = mpsc::channel();
-        let err = spawn_model_worker(
-            test_serve_config(model_dir.to_string_lossy().into_owned()),
-            work_rx,
-        )
-        .expect_err("empty model dir should fail startup");
-
-        std::fs::remove_dir_all(&model_dir).expect("remove temp model dir");
-
-        let message = format!("{err:#}");
-        assert!(message.contains("model worker failed to initialize"));
-        assert!(message.contains("loading config.json"));
-    }
-
-    #[tokio::test]
-    async fn invalid_streaming_request_returns_bad_request_before_sse() {
-        let (work_tx, work_rx) = mpsc::channel();
-        let state = test_app_state(work_tx.clone());
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": true,
-            "n": 2
-        }));
-
-        let response = create_chat_completion(State(state), Json(req)).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(matches!(work_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    }
-
-    #[tokio::test]
-    async fn invalid_streaming_content_returns_bad_request_before_sse() {
-        let (work_tx, work_rx) = mpsc::channel();
-        let state = test_app_state(work_tx.clone());
-        let req = request(json!({
-            "model": "qwen",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
-                    ]
-                }
-            ],
-            "stream": true
-        }));
-
-        let response = create_chat_completion(State(state), Json(req)).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(matches!(work_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    }
+        shutdown.cancel();
+    });
+    token
 }

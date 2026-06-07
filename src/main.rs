@@ -73,16 +73,8 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 8000)]
         port: u16,
-        /// Default generation length and maximum accepted per-request cap.
-        #[arg(long, default_value_t = 256)]
-        max_tokens: usize,
-        #[arg(long, default_value_t = 0.0, value_parser = parse_temp)]
-        temp: f32,
         #[arg(long, default_value = "2048")]
         prefill_step_size: NonZeroUsize,
-        /// Skip applying the chat template (render messages as plain text).
-        #[arg(long)]
-        no_chat_template: bool,
     },
 }
 
@@ -196,19 +188,13 @@ async fn main() -> Result<()> {
             model,
             host,
             port,
-            max_tokens,
-            temp,
             prefill_step_size,
-            no_chat_template,
         } => {
             serve(ServeConfig {
                 model,
                 host,
                 port,
-                default_max_tokens: max_tokens,
-                default_temperature: temp,
                 prefill_step_size,
-                no_chat_template,
             })
             .await
         }

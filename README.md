@@ -55,7 +55,7 @@ Useful flags:
 - `--no-stream` — don't flush stdout per token (cheaper for non-interactive use)
 - `--no-stats` — suppress trailing prompt/gen tps + peak memory lines
 
-## OpenAI-compatible server
+## vLLM frontend server
 
 ```sh
 cargo run --release -- serve \
@@ -64,10 +64,16 @@ cargo run --release -- serve \
     --port 8000
 ```
 
-Supported endpoints:
+The server uses vLLM's Rust frontend for the OpenAI HTTP layer. vLLM handles
+request parsing, chat-template rendering, tokenization, detokenization, and SSE
+streaming; `mlx-lm-rs` plugs in as the local engine core over the same
+ZMQ/msgpack bridge shape used by vLLM engines.
+
+Common endpoints:
 
 - `GET /health`
 - `GET /v1/models`
+- `POST /v1/completions`
 - `POST /v1/chat/completions`
 
 Basic chat completion:
@@ -96,11 +102,10 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The server handles one generation at a time. It supports text messages,
-`max_tokens` / `max_completion_tokens`, `temperature`, `stream`, and `n=1`.
-Requests above the server `--max-tokens` cap are rejected. Tool calling,
-JSON/schema-constrained output, stop sequences, and multimodal message parts are
-rejected explicitly for now.
+The MLX engine still handles one generation at a time. vLLM owns request
+defaults and frontend behavior; the local engine bridge only consumes prompt
+token ids, sampling temperature, EOS behavior, and `max_tokens`, then streams
+token ids back to vLLM.
 
 ## Bench
 
